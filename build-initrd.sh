@@ -1,184 +1,192 @@
-#!/bin/sh
+#!/bin/bash
+set -e
 
 set -e
 
-MINIENV_HOOKS="cryptroot plymouth unl0kr droidian-encryption-service parse-android-dynparts dmsetup"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${DIR}/../.." && pwd)"
+TOOLS_DIR="${PROJECT_ROOT}/tools/build"
+BUILD_DIR="${PROJECT_ROOT}/build"
+OUTPUT_DIR="${BUILD_DIR}/output"
 
-export FLASH_KERNEL_SKIP=1
-export DEBIAN_FRONTEND=noninteractive
-DEFAULTMIRROR="https://archive.debian.org/debian"
-APT_COMMAND="apt -y"
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $@" | tee -a "${BUILD_DIR}/logs/initramfs_build.log"
+}
+
+check_docker() {
+    if ! command -v docker &> /dev/null; then
+        log "ERROR: docker is not installed. Please install Docker first."
+        exit 1
+    fi
+}
 
 usage() {
-	echo "Usage:
-
--a|--arch     Architecture to create initrd for. Default armhf
--m|--mirror   Custom mirror URL to use. Must serve your arch.
--r|--recovery Build a recovery image
--c|--compress Compression to use
--n|--name     Target file name
-"
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -a, --arch ARCH      Architecture to build for (default: arm64)"
+    echo "  -m, --mirror URL     Debian mirror URL"
+    echo "  -o, --out DIR       Output directory"
+    echo "  -h, --help          Show this help message"
+    echo ""
+    echo "Security:"
+    echo "  This script uses Docker containers to isolate the build environment."
+    echo "  No direct system modifications will be made."
 }
 
-echob() {
-	echo "Builder: $@"
-}
+ARCH="arm64"
+MIRROR=""
+OUT_DIR="${OUTPUT_DIR}"
 
 while [ $# -gt 0 ]; do
-	case "$1" in
-	-h | --help)
-		usage
-		exit 0
-		;;
-	-r | --recovery)
-		echob "Recovery image request"
-		IS_RECOVERY="yes"
-		;;
-	-a | --arch)
-		[ -n "$2" ] && ARCH=$2 shift || usage
-		;;
-	-m | --mirror)
-		[ -n "$2" ] && MIRROR=$2 shift || usage
-		;;
-	-c | --compress)
-		[ -n "$2" ] && COMPRESS=$2 shift || usage
-		;;
-	-n | --name)
-		[ -n "$2" ] && FILENAME=$2 shift || usage
-		;;
-	esac
-	shift
+    case "$1" in
+        -a|--arch)
+            ARCH="$2"
+            shift 2
+            ;;
+        -m|--mirror)
+            MIRROR="$2"
+            shift 2
+            ;;
+        -o|--out)
+            OUT_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
 done
 
-# Defaults for all arguments, so they can be set by the environment
-[ -z $ARCH ] && ARCH="armhf"
-[ -z $MIRROR ] && MIRROR=$DEFAULTMIRROR
-[ -z $RELEASE ] && RELEASE="stretch"
-[ -z $ROOT ] && ROOT=./build/$ARCH
-[ -z $OUT ] && OUT=./out
-[ -z $IS_RECOVERY ] && IS_RECOVERY="no"
-[ -z $COMPRESS ] && COMPRESS="gzip"
-[ -z $FILENAME ] && FILENAME="initrd.img-halium-generic"
+initramfs_builder_image="vamos-droidian-initramfs-builder:latest"
 
-# list all packages needed for halium's initrd here
-[ -z $INCHROOTPKGS ] && INCHROOTPKGS="initramfs-tools dctrl-tools e2fsprogs libc6-dev zlib1g-dev libssl-dev busybox-static lvm2 cryptsetup xkb-data dropbear pigz liblz4-tool"
+log "=========================================="
+log "Safe Initramfs Build (Docker Isolated)"
+log "=========================================="
+log ""
+log "Configuration:"
+log "  Architecture: ${ARCH}"
+log "  Output:       ${OUT_DIR}"
+log "  Docker Image: ${initramfs_builder_image}"
+log "=========================================="
+log ""
 
-BOOTSTRAP_BIN="debootstrap --arch $ARCH --variant=minbase"
+check_docker
 
-umount_chroot() {
-	chroot $ROOT umount /sys >/dev/null 2>&1 || true
-	chroot $ROOT umount /proc >/dev/null 2>&1 || true
-	chroot $ROOT umount /orig >/dev/null 2>&1 || true
-	echo
-}
+mkdir -p "${BUILD_DIR}/logs"
+mkdir -p "${OUT_DIR}"
 
-do_chroot() {
-	trap umount_chroot INT EXIT
-	ROOT="$1"
-	CMD="$2"
-	echob "Executing \"$2\" in chroot"
-	mount -o bind / $ROOT/orig
-	chroot $ROOT mount -t proc proc /proc
-	chroot $ROOT mount -t sysfs sys /sys
-	chroot $ROOT $CMD
-	umount_chroot
-	trap - INT EXIT
-}
-
-if [ ! -e $ROOT/.min-done ]; then
-
-	[ -d $ROOT ] && rm -r $ROOT
-
-	# create a plain chroot to work in
-	echob "Creating chroot with arch $ARCH in $ROOT"
-	mkdir build || true
-	$BOOTSTRAP_BIN $RELEASE $ROOT $MIRROR || cat $ROOT/debootstrap/debootstrap.log
-
-	mkdir -p $ROOT/orig
-
-	#sed -i 's/main$/main universe/' $ROOT/etc/apt/sources.list
-	sed -i 's,'"$DEFAULTMIRROR"','"$MIRROR"',' $ROOT/etc/apt/sources.list
-
-	# make sure we do not start daemons at install time
-	mv $ROOT/sbin/start-stop-daemon $ROOT/sbin/start-stop-daemon.REAL
-	echo $START_STOP_DAEMON >$ROOT/sbin/start-stop-daemon
-	chmod a+rx $ROOT/sbin/start-stop-daemon
-
-	echo $POLICY_RC_D >$ROOT/usr/sbin/policy-rc.d
-
-	# after the switch to systemd we now need to install upstart explicitly
-	echo "nameserver 8.8.8.8" >$ROOT/etc/resolv.conf
-	do_chroot $ROOT "$APT_COMMAND update"
-
-	# We also need to install dpkg-dev in order to use dpkg-architecture.
-	do_chroot $ROOT "$APT_COMMAND install dpkg-dev --no-install-recommends"
-
-	touch $ROOT/.min-done
+if ! docker image inspect "${initramfs_builder_image}" > /dev/null 2>&1; then
+    log "Building Docker image: ${initramfs_builder_image}"
+    docker buildx build \
+        -f "${TOOLS_DIR}/Dockerfile.initramfs" \
+        -t "${initramfs_builder_image}" \
+        --build-arg UID="$(id -u)" \
+        --build-arg GID="$(id -g)" \
+        "${PROJECT_ROOT}" \
+        --load
+    log "Docker image built successfully"
 else
-	echob "Build environment for $ARCH found, reusing."
+    log "Docker image already exists, using cached version"
 fi
 
-# install all packages we need to roll the generic initrd
-do_chroot $ROOT "$APT_COMMAND update"
-do_chroot $ROOT "$APT_COMMAND dist-upgrade"
-do_chroot $ROOT "$APT_COMMAND install $INCHROOTPKGS --no-install-recommends"
-DEB_HOST_MULTIARCH=$(chroot $ROOT dpkg-architecture -q DEB_HOST_MULTIARCH)
+CHROOT_DIR="${BUILD_DIR}/initramfs_chroot_${ARCH}"
+INITRAMFS_OUT="${BUILD_DIR}/initramfs_out"
 
-# Droidian: copy touchscreen, keyboard data
-cp /etc/udev/rules.d/90-touchscreen.rules "${ROOT}/etc/udev/rules.d"
-cp -R /usr/share/X11/xkb/* "${ROOT}/usr/share/X11/xkb"
-mkdir -p "${ROOT}/usr/lib/udev/hwdb.d"
-cp -R /usr/lib/udev/hwdb.d/* "${ROOT}/usr/lib/udev/hwdb.d"
+container_id=""
+cleanup() {
+    if [ -n "$container_id" ]; then
+        log "Cleaning up container..."
+        docker container rm -f "$container_id" > /dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
 
-cp -a conf/halium ${ROOT}/usr/share/initramfs-tools/conf.d
-cp -a scripts/* ${ROOT}/usr/share/initramfs-tools/scripts
-cp -a hooks/* ${ROOT}/usr/share/initramfs-tools/hooks
-if [ "${IS_RECOVERY}" = "yes" ]; then
-	cp -av hooks-recovery/* ${tmpdir}/etc/initramfs-tools/hooks
-fi
+log "[1/4] Starting isolated build container..."
+container_id=$(docker run -d \
+    --rm \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges \
+    -u "$(id -u):$(id -g)" \
+    -v "${PROJECT_ROOT}":"${PROJECT_ROOT}":ro \
+    -v "${BUILD_DIR}":"${BUILD_DIR}":rw \
+    -w "${PROJECT_ROOT}" \
+    "${initramfs_builder_image}")
 
-VER="$ARCH"
-export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/lib/$DEB_HOST_MULTIARCH"
+log "[2/4] Creating Debian chroot environment..."
+docker exec "$container_id" bash -c "
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
 
-# Create minienv
-export DESTDIR="/tmp/droidian-minienv"
-export verbose="y"
+    mkdir -p ${CHROOT_DIR}
+    mkdir -p ${INITRAMFS_OUT}
 
-# Create initial skeleton, hook might get confused
-mkdir -p ${DESTDIR}/etc ${DESTDIR}/usr/lib ${DESTDIR}/lib ${DESTDIR}/mnt ${DESTDIR}/tmp
+    if [ ! -f ${CHROOT_DIR}/.min-done ]; then
+        echo 'Bootstrap Debian ${ARCH}...'
+        debootstrap --arch ${ARCH} --variant=minbase bookworm ${CHROOT_DIR} ${MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian} || \
+            debootstrap --arch ${ARCH} --variant=minbase bookworm ${CHROOT_DIR} ${MIRROR:-http://mirrors.ustc.edu.cn/debian}
+        touch ${CHROOT_DIR}/.min-done
+        echo 'Bootstrap complete'
+    else
+        echo 'Using existing chroot environment'
+    fi
+" 2>&1 | tee -a "${BUILD_DIR}/logs/initramfs_build.log"
 
-# Droidian specific
-/usr/sbin/plymouth-set-default-theme -R droidian
+log "[3/4] Installing initramfs packages..."
+docker exec "$container_id" bash -c "
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
 
-export __MODULES_TO_ADD="$(mktemp "${TMPDIR:-/var/tmp}/modules_XXXXXX")"
-for hook in ${MINIENV_HOOKS}; do
-	bash -x /usr/share/initramfs-tools/hooks/${hook}
-done
+    echo 'Updating package lists...'
+    chroot ${CHROOT_DIR} apt-get update
 
-# stretch does not have /usr merged, so simply move stuff to /lib
-# instead. This allows to properly overlay in /minienv
-mv ${DESTDIR}/usr/lib/* ${DESTDIR}/lib
+    echo 'Installing packages...'
+    chroot ${CHROOT_DIR} apt-get install -y --no-install-recommends \
+        initramfs-tools \
+        dctrl-tools \
+        e2fsprogs \
+        lvm2 \
+        cryptsetup \
+        busybox-static
 
-# Move the linker in a known place
-mv -v ${DESTDIR}/lib/*/ld-linux-*.so.* ${DESTDIR}/lib/droidian-minienv-linker.so
+    echo 'Copying Halium configuration...'
+    mkdir -p ${CHROOT_DIR}/usr/share/initramfs-tools/conf.d
+    mkdir -p ${CHROOT_DIR}/usr/share/initramfs-tools/scripts
+    mkdir -p ${CHROOT_DIR}/usr/share/initramfs-tools/hooks
 
-if [ "${COMPRESS}" = "lz4" ] && [ ! -e "${ROOT}/usr/bin/lz4-wrapper" ]; then
-	# This is unfortunately needed as mkinitramfs checks for the command
-	# existence, so we can't overload the compress variable
-	cat > ${ROOT}/usr/bin/lz4-wrapper <<EOF
-#!/bin/sh -x
-exec lz4 -9 -l $@
-EOF
-	chmod +x ${ROOT}/usr/bin/lz4-wrapper
-	COMPRESS="lz4-wrapper"
-fi
-do_chroot $ROOT "env compress=${COMPRESS} update-initramfs -tc -khalium-generic -v"
+    cp ${DIR}/conf/halium ${CHROOT_DIR}/usr/share/initramfs-tools/conf.d/
+    cp -r ${DIR}/scripts/* ${CHROOT_DIR}/usr/share/initramfs-tools/scripts/ 2>/dev/null || true
+    cp -r ${DIR}/hooks/* ${CHROOT_DIR}/usr/share/initramfs-tools/hooks/ 2>/dev/null || true
+" 2>&1 | tee -a "${BUILD_DIR}/logs/initramfs_build.log"
 
-rm -rf ${DESTDIR}
+log "[4/4] Building initramfs..."
+docker exec "$container_id" bash -c "
+    set -e
 
-mkdir "$OUT" >/dev/null 2>&1 || true
-cp "$ROOT/boot/initrd.img-halium-generic" "$OUT/${FILENAME}"
-cd "$OUT"
-sha256sum "${FILENAME}" > "${FILENAME}.sha256"
-date -R > "${FILENAME}.timestamp"
-cd - >/dev/null 2>&1
+    echo 'Generating initramfs...'
+    chroot ${CHROOT_DIR} update-initramfs -tc -k all -v
+
+    echo 'Copying output...'
+    cp ${CHROOT_DIR}/boot/initrd.img-* ${INITRAMFS_OUT}/initrd.img-halium-generic
+
+    if [ -f ${INITRAMFS_OUT}/initrd.img-halium-generic ]; then
+        echo 'Initramfs created successfully!'
+        ls -lh ${INITRAMFS_OUT}/initrd.img-halium-generic
+    else
+        echo 'ERROR: Failed to create initramfs!'
+        exit 1
+    fi
+" 2>&1 | tee -a "${BUILD_DIR}/logs/initramfs_build.log"
+
+log ""
+log "=========================================="
+log "Build complete!"
+log "Output: ${INITRAMFS_OUT}/initrd.img-halium-generic"
+log "Log: ${BUILD_DIR}/logs/initramfs_build.log"
+log "=========================================="
